@@ -1,2 +1,1 @@
-# CubePanel agent
-Gerido pelo painel. Não editar.
+# NovaPanel legacy compatibility layer — managed by the panel.
