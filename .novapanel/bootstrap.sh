@@ -1,8 +1,12 @@
 #!/usr/bin/env bash
 set -e
-cd "$(dirname "$0")/.."
+ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
+cd "$ROOT_DIR"
 echo "[NovaPanel] Setup..."
 mkdir -p .novapanel server
+[ -d .cubepanel ] || mkdir -p .cubepanel
+[ -f .novapanel/bootstrap.sh ] && cp .novapanel/bootstrap.sh .cubepanel/bootstrap.sh || true
+[ -f .novapanel/agent.js ] && cp .novapanel/agent.js .cubepanel/agent.js || true
 [ ! -f server/eula.txt ] && echo "eula=true" > server/eula.txt
 if [ ! -f package.json ]; then
   printf '{
