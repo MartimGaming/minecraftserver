@@ -1,33 +1,42 @@
 #!/usr/bin/env node
-// CubePanel Agent — runs inside Codespace.
-// Spawns java, pipes stdio, parses logs, reports metrics + player events.
+// NovaPanel Agent — Java/Bedrock/Eaglercraft + Geyser + Playit
 const { spawn, execSync } = require("child_process");
 const fs = require("fs");
 const path = require("path");
 const https = require("https");
 const os = require("os");
 
-const SUPABASE_URL = process.env.CUBEPANEL_SUPABASE_URL || "https://tdoxrhbuelynvghngeyb.supabase.co";
-const AGENT_TOKEN = process.env.CUBEPANEL_AGENT_TOKEN || "09549403c6999314405896282c63d42352cf85ab3c12b0c2c9de0e9705e05e2b";
-const SERVER_DIR = fs.existsSync(path.resolve(__dirname, 'server')) ? path.resolve(__dirname, 'server') : path.resolve(__dirname, '..', 'server');
-const JAR_URL_FILE = fs.existsSync(path.join(__dirname, '.cubepanel', 'jar_url.txt')) ? path.join(__dirname, '.cubepanel', 'jar_url.txt') : path.join(__dirname, 'jar_url.txt');
-const IMPORT_FILE = fs.existsSync(path.join(__dirname, '.cubepanel', 'import.json')) ? path.join(__dirname, '.cubepanel', 'import.json') : path.join(__dirname, 'import.json');
+const SUPABASE_URL = process.env.NOVAPANEL_SUPABASE_URL || "https://yooqmcdouubgusezozas.supabase.co";
+const AGENT_TOKEN = process.env.NOVAPANEL_AGENT_TOKEN || "6c211ffeb9e4954e982227a42021ebdb70e16b8c0fd53ac33d5a8f96d275436a";
+const SERVER_KIND = process.env.NOVAPANEL_KIND || "java";  // java | bedrock | eaglercraft
+const JAVA_BIN = process.env.NOVAPANEL_JAVA_BIN || "/usr/lib/jvm/msopenjdk-current/bin/java";
+const SERVER_DIR = path.resolve(__dirname, "server");
+
+// Strip ANSI escape codes (CSI sequences, OSC, single-char escapes), cursor moves,
+// carriage returns and ALL non-printable control bytes. Playit uses lots of these
+// for live-rendering its TUI which spam the console useless garbage.
+const ANSI_RE = /\x1b\[[0-9;?]*[ -\/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\x1b[=>PX^_]|\x1b\([B0]|\r/g;
+const cleanLine = (s) => s.replace(ANSI_RE, "").replace(/[\x00-\x08\x0b-\x1f\x7f]/g, "").trim();
+// Drop noise: pure cursor/blank residue, or lines that don't have at least 3 letters/digits.
+const isNoise = (s) => !s || s.length < 3 || !/[A-Za-z0-9]{3,}/.test(s);
+const JAR_URL_FILE = path.join(__dirname, ".novapanel", "jar_url.txt");
+const IMPORT_FILE = path.join(__dirname, ".novapanel", "import.json");
 
 if (!SUPABASE_URL || !AGENT_TOKEN) {
-  console.error("[CubePanel] Missing CUBEPANEL_SUPABASE_URL or CUBEPANEL_AGENT_TOKEN");
+  console.error("[NovaPanel] Missing NOVAPANEL_SUPABASE_URL or NOVAPANEL_AGENT_TOKEN");
   process.exit(1);
 }
 
 let mc = null;
-const players = new Map(); // name -> { joined_at, uuid }
+const players = new Map();
 let startedAt = null;
 let lastTps = 20;
 let lastCpu = 0;
 const LOG_BUF = [];
 
-function api(method, path, body, headers) {
+function api(method, p, body, headers) {
   return new Promise((resolve) => {
-    const url = new URL(SUPABASE_URL + path);
+    const url = new URL(SUPABASE_URL + p);
     const data = body ? JSON.stringify(body) : null;
     const req = https.request({
       method, hostname: url.hostname, path: url.pathname + url.search,
@@ -45,11 +54,14 @@ function api(method, path, body, headers) {
     req.end();
   });
 }
-
-const post = (path, body) => api("POST", path, body);
-const get = (path) => api("GET", path);
+const post = (p, body) => api("POST", p, body);
+const get = (p) => api("GET", p);
 
 let publicAddress = null;
+let bedrockPublicAddress = null;
+let authUrl = null;
+let cleaning = false;
+let eaglercraftWebUrl = null;
 
 async function reportMetrics() {
   const total = os.totalmem();
@@ -67,15 +79,20 @@ async function reportMetrics() {
       live_cpu_percent: lastCpu,
       live_tps: lastTps,
       live_uptime_seconds: uptime,
-      agent_status: mc ? "running" : "connected",
+      agent_status: cleaning ? "cleaning" : (mc ? "running" : "connected"),
       public_address: publicAddress,
+      bedrock_public_address: bedrockPublicAddress,
+      eaglercraft_web_url: eaglercraftWebUrl,
+      auth_url: authUrl,
     },
   });
 }
 
 async function flushLogs() {
   if (!LOG_BUF.length) return;
-  const lines = LOG_BUF.splice(0, Math.min(LOG_BUF.length, 50));
+  const lines = LOG_BUF.splice(0, Math.min(LOG_BUF.length, 50))
+    .map(cleanLine).filter((l) => !isNoise(l));
+  if (!lines.length) return;
   await post("/functions/v1/agent-relay", { action: "logs", data: { lines } });
 }
 
@@ -84,116 +101,168 @@ async function announcePlayer(event, name, uuid) {
 }
 
 function parseLogLine(line) {
-  // Player join: "Steve[/127.0.0.1:1234] logged in with entity id ..."
-  const join = line.match(/(?:^|: )([A-Za-z0-9_]{2,16})\[\/[\d\.:]+\] logged in/);
-  if (join) {
-    const name = join[1];
-    if (!players.has(name)) {
-      players.set(name, { joined_at: Date.now() });
-      announcePlayer("join", name);
-    }
-  }
-  // Player leave
-  const leave = line.match(/(?:^|: )([A-Za-z0-9_]{2,16}) (?:lost connection|left the game)/);
-  if (leave) {
-    const name = leave[1];
-    if (players.has(name)) {
-      players.delete(name);
-      announcePlayer("leave", name);
-    }
-  }
-  // TPS lines (Paper)
+  // Java player join
+  let m = line.match(/(?:^|: )([A-Za-z0-9_]{2,16})\[\/[\d\.:]+\] logged in/);
+  if (m && !players.has(m[1])) { players.set(m[1], { joined_at: Date.now() }); announcePlayer("join", m[1]); }
+  m = line.match(/(?:^|: )([A-Za-z0-9_]{2,16}) (?:lost connection|left the game)/);
+  if (m && players.has(m[1])) { players.delete(m[1]); announcePlayer("leave", m[1]); }
+  // Bedrock player connect
+  m = line.match(/Player connected: ([A-Za-z0-9_ ]{2,32}), xuid:/);
+  if (m && !players.has(m[1])) { players.set(m[1], { joined_at: Date.now() }); announcePlayer("join", m[1]); }
+  m = line.match(/Player disconnected: ([A-Za-z0-9_ ]{2,32}), xuid:/);
+  if (m && players.has(m[1])) { players.delete(m[1]); announcePlayer("leave", m[1]); }
+  // TPS
   const tps = line.match(/TPS from last 1m[^\d]+([\d\.]+)/);
   if (tps) lastTps = Math.min(20, parseFloat(tps[1]));
-  // playit.gg public address: "tcp://yourname.playit.gg:12345" or "minecraft.yourname.playit.gg:12345"
-  const playit = line.match(/([a-zA-Z0-9-]+\.playit\.gg(?::\d+)?)/);
-  if (playit) publicAddress = playit[1];
+
+  // Playit address — broad capture (xxx.gl.joinmc.link, xxx.playit.gg, xxx.tunnel.playit.gg)
+  // Format from playit log: "Tunnel ready: xxxx.gl.joinmc.link:25565"
+  const playit1 = line.match(/((?:[a-zA-Z0-9-]+\.)+(?:gl\.joinmc\.link|playit\.gg|tunnel\.playit\.gg|joinmc\.link)(?::\d+)?)/);
+  if (playit1) {
+    const addr = playit1[1];
+    // Bedrock typically has port 19132
+    if (addr.includes(":19132") || /bedrock/i.test(line)) bedrockPublicAddress = addr;
+    else publicAddress = addr;
+  }
+  // Playit auth claim URL
+  const claim = line.match(/(https?:\/\/(?:[a-z0-9-]+\.)?playit\.gg\/[A-Za-z0-9\/_\-?=&%.#]+)/);
+  if (claim) authUrl = claim[1];
 }
 
 let playitProc = null;
 function startPlayit() {
   if (playitProc) return;
   const playitBin = path.join(__dirname, "playit");
-  if (!fs.existsSync(playitBin)) { LOG_BUF.push("[CubePanel] playit não instalado — pula tunnel."); return; }
-  LOG_BUF.push("[CubePanel] A iniciar túnel playit.gg (visita o link em baixo para autorizar 1x)...");
-  playitProc = spawn(playitBin, [], { cwd: __dirname, shell: false });
+  if (!fs.existsSync(playitBin)) { LOG_BUF.push("[NovaPanel] playit não instalado — pula tunnel."); return; }
+  LOG_BUF.push("[NovaPanel] A iniciar túnel playit.gg...");
+  const env = Object.assign({}, process.env, { NO_COLOR: "1", TERM: "dumb", CI: "1" });
+  playitProc = spawn(playitBin, [], { cwd: __dirname, shell: false, env });
   const handle = (d) => {
     const s = d.toString();
-    for (const line of s.split(/\r?\n/).filter(Boolean)) {
-      LOG_BUF.push("[playit] " + line);
+    for (const raw of s.split(/\r?\n/)) {
+      const line = cleanLine(raw);
+      if (isNoise(line)) continue;
+      // Always parse (capture tunnel/auth URLs even from noisy frames)
       parseLogLine(line);
+      // Only forward meaningful playit messages — skip its TUI re-renders.
+      if (/(tunnel|claim|playit\.gg|joinmc|ready|error|fail|connected|disconnect|http)/i.test(line)) {
+        LOG_BUF.push("[playit] " + line);
+      }
     }
   };
   playitProc.stdout.on("data", handle);
   playitProc.stderr.on("data", handle);
-  playitProc.on("exit", () => { playitProc = null; LOG_BUF.push("[CubePanel] playit parou."); });
+  playitProc.on("exit", () => { playitProc = null; LOG_BUF.push("[NovaPanel] playit parou."); });
+}
+
+async function downloadFile(url, dest) {
+  LOG_BUF.push("[NovaPanel] Download " + url);
+  execSync("curl -fsSL -o " + JSON.stringify(dest) + " " + JSON.stringify(url), { stdio: "inherit" });
 }
 
 async function ensureJar() {
-  // If user clicked "Resolve JAR" in panel, server_jar_url is written to repo via marker.
-  // For now, the github-proxy resolves the URL and the agent downloads it on-demand.
+  if (SERVER_KIND === "bedrock" || SERVER_KIND === "eaglercraft") return true;
   const jarPath = path.join(SERVER_DIR, "server.jar");
   if (fs.existsSync(jarPath)) return true;
   if (!fs.existsSync(JAR_URL_FILE)) {
-    LOG_BUF.push("[CubePanel] server.jar não existe e jar_url.txt não foi configurado.");
+    LOG_BUF.push("[NovaPanel] server.jar não existe e jar_url.txt não foi configurado.");
     return false;
   }
   const url = fs.readFileSync(JAR_URL_FILE, "utf8").trim();
-  LOG_BUF.push("[CubePanel] A descarregar server.jar de " + url);
+  try { await downloadFile(url, jarPath); LOG_BUF.push("[NovaPanel] server.jar OK."); return true; }
+  catch (e) { LOG_BUF.push("[NovaPanel] Falha download: " + e.message); return false; }
+}
+
+async function ensureBedrock() {
+  const bin = path.join(SERVER_DIR, "bedrock_server");
+  if (fs.existsSync(bin)) return true;
+  LOG_BUF.push("[NovaPanel] A descarregar Bedrock Dedicated Server...");
   try {
-    execSync("curl -sSL -o " + JSON.stringify(jarPath) + " " + JSON.stringify(url), { stdio: "inherit" });
-    LOG_BUF.push("[CubePanel] Download concluído.");
+    // Latest BDS download (Mojang requires HTML scrape — usar URL conhecida)
+    const url = "https://www.minecraft.net/bedrockdedicatedserver/bin-linux/bedrock-server.zip";
+    const zip = path.join(SERVER_DIR, "bds.zip");
+    await downloadFile(url, zip);
+    execSync("cd " + JSON.stringify(SERVER_DIR) + " && unzip -o bds.zip && rm bds.zip && chmod +x bedrock_server", { stdio: "inherit" });
     return true;
   } catch (e) {
-    LOG_BUF.push("[CubePanel] Falha no download: " + e.message);
+    LOG_BUF.push("[NovaPanel] Falha BDS: " + e.message + " — descarrega manualmente bedrock_server para /server.");
     return false;
   }
+}
+
+async function ensureEaglercraft() {
+  // BungeeCord + EaglercraftXBungee
+  const bcJar = path.join(SERVER_DIR, "BungeeCord.jar");
+  if (!fs.existsSync(bcJar)) {
+    try { await downloadFile("https://ci.md-5.net/job/BungeeCord/lastSuccessfulBuild/artifact/bootstrap/target/BungeeCord.jar", bcJar); }
+    catch (e) { LOG_BUF.push("[NovaPanel] Falha BungeeCord: " + e.message); return false; }
+  }
+  const pluginsDir = path.join(SERVER_DIR, "plugins");
+  if (!fs.existsSync(pluginsDir)) fs.mkdirSync(pluginsDir, { recursive: true });
+  const eaglerJar = path.join(pluginsDir, "EaglercraftXBungee.jar");
+  if (!fs.existsSync(eaglerJar)) {
+    try { await downloadFile("https://github.com/lax1dude/eaglercraft-bungee/releases/latest/download/EaglercraftXBungee.jar", eaglerJar); }
+    catch (e) { LOG_BUF.push("[NovaPanel] Falha EaglercraftXBungee: " + e.message); }
+  }
+  return true;
 }
 
 async function startServer() {
   if (mc) return;
-  const ok = await ensureJar();
-  if (!ok) return;
-  const jarPath = path.join(SERVER_DIR, "server.jar");
-  if (!fs.existsSync(jarPath)) {
-    LOG_BUF.push("[CubePanel] ERRO: server.jar não encontrado em " + jarPath + ". Configura o tipo/versão no painel e clica 'Resolver JAR'.");
-    return;
-  }
-  // Parse CUBEPANEL_JAVA_CMD into argv (no shell). Defaults to safe args.
-  const raw = (process.env.CUBEPANEL_JAVA_CMD || "java -Xms2G -Xmx4G -jar server.jar nogui").trim();
-  const tokens = raw.match(/(?:[^\s"]+|"[^"]*")+/g) || ["java"];
-  const argv = tokens.map((t) => t.replace(/^"|"$/g, ""));
-  const bin = argv.shift() || "java";
-  LOG_BUF.push("[CubePanel] $ " + bin + " " + argv.join(" "));
-  startPlayit();
+  cleaning = true;
+  LOG_BUF.push("[NovaPanel] A limpar ambiente (kill java + session.lock)...");
+  try { execSync("pkill -f java || true", { stdio: "ignore" }); } catch {}
+  try { execSync("pkill -f bedrock_server || true", { stdio: "ignore" }); } catch {}
   try {
-    mc = spawn(bin, argv, { cwd: SERVER_DIR, shell: false, stdio: ["pipe", "pipe", "pipe"] });
-  } catch (e) {
-    LOG_BUF.push("[CubePanel] Falha ao arrancar Java: " + e.message + ". Verifica se 'java' está no PATH (java -version).");
-    mc = null;
-    return;
+    const lock = path.join(SERVER_DIR, "world", "session.lock");
+    if (fs.existsSync(lock)) { fs.unlinkSync(lock); LOG_BUF.push("[NovaPanel] session.lock removido."); }
+  } catch {}
+  cleaning = false;
+
+  if (SERVER_KIND === "bedrock") {
+    if (!await ensureBedrock()) return;
+    LOG_BUF.push("[NovaPanel] $ ./bedrock_server");
+    startPlayit();
+    try {
+      const env = Object.assign({}, process.env, { LD_LIBRARY_PATH: "." });
+      mc = spawn("./bedrock_server", [], { cwd: SERVER_DIR, shell: false, env });
+    } catch (e) { LOG_BUF.push("[NovaPanel] Falha ao arrancar Bedrock: " + e.message); return; }
+  } else if (SERVER_KIND === "eaglercraft") {
+    if (!await ensureEaglercraft()) return;
+    LOG_BUF.push("[NovaPanel] $ java -jar BungeeCord.jar (Eaglercraft proxy)");
+    startPlayit();
+    try {
+      mc = spawn("java", ["-Xms512M", "-Xmx2G", "-jar", "BungeeCord.jar"], { cwd: SERVER_DIR, shell: false });
+      eaglercraftWebUrl = "https://eaglercraft.com/mc/1.8.8-wasm/";
+    } catch (e) { LOG_BUF.push("[NovaPanel] Falha Eaglercraft: " + e.message); return; }
+  } else {
+    if (!await ensureJar()) return;
+    const raw = (process.env.NOVAPANEL_JAVA_CMD || "java -Xms2G -Xmx4G -jar server.jar nogui").trim();
+    const tokens = raw.match(/(?:[^\s"]+|"[^"]*")+/g) || ["java"];
+    const argv = tokens.map((t) => t.replace(/^"|"$/g, ""));
+    let bin = argv.shift() || "java";
+    if (bin === "java" && fs.existsSync(JAVA_BIN)) bin = JAVA_BIN;
+    LOG_BUF.push("[NovaPanel] $ " + bin + " " + argv.join(" "));
+    startPlayit();
+    try { mc = spawn(bin, argv, { cwd: SERVER_DIR, shell: false, stdio: ["pipe", "pipe", "pipe"] }); }
+    catch (e) { LOG_BUF.push("[NovaPanel] Falha: " + e.message); return; }
   }
+
   startedAt = Date.now();
   players.clear();
-  mc.on("error", (err) => {
-    LOG_BUF.push("[CubePanel] Erro de processo Java: " + err.message + (err.code === "ENOENT" ? " (binário 'java' não encontrado no PATH)" : ""));
-    mc = null; startedAt = null;
-  });
+  mc.on("error", (err) => { LOG_BUF.push("[NovaPanel] Erro: " + err.message); mc = null; startedAt = null; });
   const handle = (data) => {
     const s = data.toString();
-    const split = s.split(/\r?\n/).filter(Boolean);
-    for (const line of split) {
-      LOG_BUF.push(line);
-      parseLogLine(line);
+    for (const raw of s.split(/\r?\n/)) {
+      const line = cleanLine(raw);
+      if (isNoise(line)) continue;
+      LOG_BUF.push(line); parseLogLine(line);
     }
   };
   mc.stdout && mc.stdout.on("data", handle);
-  mc.stderr && mc.stderr.on("data", (d) => {
-    const s = "[STDERR] " + d.toString();
-    LOG_BUF.push(s);
-  });
+  mc.stderr && mc.stderr.on("data", (d) => { const s = cleanLine(d.toString()); if (!isNoise(s)) LOG_BUF.push("[STDERR] " + s); });
   mc.on("exit", (code) => {
-    LOG_BUF.push("[CubePanel] Server parou (code " + code + ").");
+    LOG_BUF.push("[NovaPanel] Server parou (code " + code + ").");
     mc = null; startedAt = null; players.clear();
     post("/functions/v1/agent-relay", { action: "players", data: { list: [] } });
   });
@@ -204,10 +273,9 @@ function stopServer() {
   try { mc.stdin.write("stop\n"); } catch {}
   setTimeout(() => { if (mc) try { mc.kill("SIGTERM"); } catch {} }, 8000);
 }
-
 function sendCmd(cmd) {
-  if (!mc) { LOG_BUF.push("[CubePanel] Servidor offline — comando ignorado: " + cmd); return; }
-  try { mc.stdin.write(cmd + "\n"); } catch (e) { LOG_BUF.push("[CubePanel] Erro: " + e.message); }
+  if (!mc) { LOG_BUF.push("[NovaPanel] Servidor offline — comando ignorado: " + cmd); return; }
+  try { mc.stdin.write(cmd + "\n"); } catch (e) { LOG_BUF.push("[NovaPanel] Erro: " + e.message); }
 }
 
 async function checkImport() {
@@ -215,16 +283,22 @@ async function checkImport() {
   try {
     const { url } = JSON.parse(fs.readFileSync(IMPORT_FILE, "utf8"));
     fs.unlinkSync(IMPORT_FILE);
-    LOG_BUF.push("[CubePanel] A importar ZIP de " + url);
+    LOG_BUF.push("[NovaPanel] A importar ZIP de " + url);
     const zipPath = path.join(__dirname, "import.zip");
     execSync("curl -sSL -o " + JSON.stringify(zipPath) + " " + JSON.stringify(url), { stdio: "inherit" });
     const unzipper = require("unzipper");
     await fs.createReadStream(zipPath).pipe(unzipper.Extract({ path: SERVER_DIR })).promise();
     fs.unlinkSync(zipPath);
-    LOG_BUF.push("[CubePanel] Import concluído.");
-  } catch (e) {
-    LOG_BUF.push("[CubePanel] Falha no import: " + e.message);
-  }
+    // Auto-detect MC version from server.properties or paper.yml
+    try {
+      const propsPath = path.join(SERVER_DIR, "server.properties");
+      if (fs.existsSync(propsPath)) {
+        const v = fs.readFileSync(propsPath, "utf8").match(/^minecraft-version=(\S+)/m);
+        if (v) LOG_BUF.push("[NovaPanel] Detected MC version from properties: " + v[1]);
+      }
+    } catch {}
+    LOG_BUF.push("[NovaPanel] Import concluído.");
+  } catch (e) { LOG_BUF.push("[NovaPanel] Falha import: " + e.message); }
 }
 
 async function poll() {
@@ -238,7 +312,7 @@ async function poll() {
   }
 }
 
-console.log("[CubePanel] Agent started.");
+console.log("[NovaPanel] Agent started. Mode=" + SERVER_KIND);
 post("/functions/v1/agent-relay", { action: "hello", data: { agent_status: "connected" } });
 setInterval(reportMetrics, 5000);
 setInterval(flushLogs, 1000);
