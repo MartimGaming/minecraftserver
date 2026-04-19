@@ -1,5 +1,5 @@
 {
-  "name": "CubePanel Minecraft Server",
+  "name": "NovaPanel Minecraft Server",
   "image": "mcr.microsoft.com/devcontainers/java:1-21-bookworm",
   "features": {
     "ghcr.io/devcontainers/features/node:1": {
@@ -8,18 +8,26 @@
   },
   "forwardPorts": [
     25565,
-    25575
+    25575,
+    19132,
+    8081
   ],
   "portsAttributes": {
+    "8081": {
+      "label": "Eaglercraft WebSocket"
+    },
+    "19132": {
+      "label": "Minecraft Bedrock"
+    },
     "25565": {
-      "label": "Minecraft",
+      "label": "Minecraft Java",
       "onAutoForward": "notify"
     },
     "25575": {
       "label": "RCON"
     }
   },
-  "postCreateCommand": "chmod +x .cubepanel/bootstrap.sh && .cubepanel/bootstrap.sh",
+  "postCreateCommand": "chmod +x .novapanel/bootstrap.sh && .novapanel/bootstrap.sh",
   "postStartCommand": "nohup node agent.js > agent.log 2>&1 &",
   "customizations": {
     "vscode": {
@@ -34,8 +42,9 @@
     "storage": "32gb"
   },
   "containerEnv": {
-    "CUBEPANEL_SUPABASE_URL": "https://tdoxrhbuelynvghngeyb.supabase.co",
-    "CUBEPANEL_AGENT_TOKEN": "09549403c6999314405896282c63d42352cf85ab3c12b0c2c9de0e9705e05e2b",
-    "CUBEPANEL_JAVA_CMD": "java -Xms2G -Xmx4G -jar server.jar nogui"
+    "NOVAPANEL_SUPABASE_URL": "https://yooqmcdouubgusezozas.supabase.co",
+    "NOVAPANEL_AGENT_TOKEN": "6c211ffeb9e4954e982227a42021ebdb70e16b8c0fd53ac33d5a8f96d275436a",
+    "NOVAPANEL_KIND": "java",
+    "NOVAPANEL_JAVA_CMD": "java -Xms2G -Xmx4G -jar server.jar nogui"
   }
 }
