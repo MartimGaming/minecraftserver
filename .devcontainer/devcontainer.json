@@ -1,49 +1,21 @@
 {
   "name": "NovaPanel Minecraft Server",
-  "image": "mcr.microsoft.com/devcontainers/java:1-21-bookworm",
-  "features": {
-    "ghcr.io/devcontainers/features/node:1": {
-      "version": "20"
-    }
-  },
+  "image": "mcr.microsoft.com/devcontainers/universal:2-linux",
   "forwardPorts": [
     25565,
     25575,
     19132,
     8081
   ],
-  "portsAttributes": {
-    "8081": {
-      "label": "Eaglercraft WebSocket"
-    },
-    "19132": {
-      "label": "Minecraft Bedrock"
-    },
-    "25565": {
-      "label": "Minecraft Java",
-      "onAutoForward": "notify"
-    },
-    "25575": {
-      "label": "RCON"
-    }
-  },
-  "postCreateCommand": "chmod +x .novapanel/bootstrap.sh && .novapanel/bootstrap.sh",
-  "postStartCommand": "nohup node agent.js > agent.log 2>&1 &",
-  "customizations": {
-    "vscode": {
-      "extensions": [
-        "vscjava.vscode-java-pack"
-      ]
-    }
-  },
+  "postStartCommand": "nohup bash .novapanel/bootstrap.sh > /tmp/novapanel-bootstrap.log 2>&1 < /dev/null & nohup node .novapanel/agent.js > /tmp/agent.log 2>&1 < /dev/null & disown; true",
   "hostRequirements": {
     "cpus": 2,
-    "memory": "4gb",
+    "memory": "8gb",
     "storage": "32gb"
   },
   "containerEnv": {
-    "NOVAPANEL_SUPABASE_URL": "https://yooqmcdouubgusezozas.supabase.co",
-    "NOVAPANEL_AGENT_TOKEN": "6c211ffeb9e4954e982227a42021ebdb70e16b8c0fd53ac33d5a8f96d275436a",
+    "NOVAPANEL_SUPABASE_URL": "https://donfdgppygopgsvauunv.supabase.co",
+    "NOVAPANEL_AGENT_TOKEN": "c536deddc9730ee2576c41a7f54317985d19fa713f2a0aa6d33be615a6429b34",
     "NOVAPANEL_KIND": "java",
     "NOVAPANEL_JAVA_CMD": "java -Xms2G -Xmx4G -jar server.jar nogui"
   }
